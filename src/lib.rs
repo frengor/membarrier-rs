@@ -60,15 +60,6 @@
 //! `membarrier`](http://man7.org/linux/man-pages/man2/membarrier.2.html).
 
 #![warn(missing_docs, missing_debug_implementations)]
-#![no_std]
-
-#[macro_use]
-extern crate cfg_if;
-#[allow(unused_imports)]
-#[macro_use]
-extern crate lazy_static;
-extern crate libc;
-extern crate windows_sys;
 
 #[allow(unused_macros)]
 macro_rules! fatal_assert {
@@ -82,13 +73,13 @@ macro_rules! fatal_assert {
     };
 }
 
-cfg_if! {
-    if #[cfg(all(target_os = "linux"))] {
-        pub use linux::*;
-    } else if #[cfg(target_os = "windows")] {
-        pub use windows::*;
+cfg_if::cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        pub use crate::linux::*;
+    } else if #[cfg(windows)] {
+        pub use crate::windows::*;
     } else {
-        pub use default::*;
+        pub use crate::default::*;
     }
 }
 
@@ -116,6 +107,7 @@ mod default {
 #[cfg(target_os = "linux")]
 mod linux {
     use core::sync::atomic;
+    use std::sync::LazyLock;
 
     /// A choice between three strategies for process-wide barrier on Linux.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,18 +120,16 @@ mod linux {
         Fallback,
     }
 
-    lazy_static! {
-        /// The right strategy to use on the current machine.
-        static ref STRATEGY: Strategy = {
-            if membarrier::is_supported() {
-                Strategy::Membarrier
-            } else if mprotect::is_supported() {
-                Strategy::Mprotect
-            } else {
-                Strategy::Fallback
-            }
-        };
-    }
+    /// The right strategy to use on the current machine.
+    static STRATEGY: LazyLock<Strategy> = LazyLock::new(|| {
+        if membarrier::is_supported() {
+            Strategy::Membarrier
+        } else if mprotect::is_supported() {
+            Strategy::Mprotect
+        } else {
+            Strategy::Fallback
+        }
+    });
 
     mod membarrier {
 
@@ -179,6 +169,7 @@ mod linux {
 
     mod mprotect {
         use core::{cell::UnsafeCell, mem::MaybeUninit, ptr, sync::atomic};
+        use std::sync::LazyLock;
 
         struct Barrier {
             lock: UnsafeCell<libc::pthread_mutex_t>,
@@ -224,50 +215,46 @@ mod linux {
             }
         }
 
-        lazy_static! {
-            /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
-            /// x86/x86-64 systems.
-            static ref BARRIER: Barrier = {
-                unsafe {
-                    // Find out the page size on the current system.
-                    let page_size = libc::sysconf(libc::_SC_PAGESIZE);
-                    fatal_assert!(page_size > 0);
-                    let page_size = page_size as libc::size_t;
+        /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
+        /// x86/x86-64 systems.
+        static BARRIER: LazyLock<Barrier> = LazyLock::new(|| unsafe {
+            // Find out the page size on the current system.
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+            fatal_assert!(page_size > 0);
+            let page_size = page_size as libc::size_t;
 
-                    // Create a dummy page.
-                    let page = libc::mmap(
-                        ptr::null_mut(),
-                        page_size,
-                        libc::PROT_NONE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1 as libc::c_int,
-                        0 as libc::off_t,
-                    );
-                    fatal_assert!(page != libc::MAP_FAILED);
-                    fatal_assert!(page as libc::size_t % page_size == 0);
+            // Create a dummy page.
+            let page = libc::mmap(
+                ptr::null_mut(),
+                page_size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1 as libc::c_int,
+                0 as libc::off_t,
+            );
+            fatal_assert!(page != libc::MAP_FAILED);
+            fatal_assert!(page as libc::size_t % page_size == 0);
 
-                    // Locking the page ensures that it stays in memory during the two mprotect
-                    // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
-                    // they would not have the expected effect of generating IPI.
-                    libc::mlock(page, page_size as libc::size_t);
+            // Locking the page ensures that it stays in memory during the two mprotect
+            // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
+            // they would not have the expected effect of generating IPI.
+            libc::mlock(page, page_size as libc::size_t);
 
-                    // Initialize the mutex.
-                    let lock = UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER);
-                    let mut attr = MaybeUninit::<libc::pthread_mutexattr_t>::uninit();
-                    fatal_assert!(libc::pthread_mutexattr_init(attr.as_mut_ptr()) == 0);
-                    let mut attr = attr.assume_init();
-                    fatal_assert!(
+            // Initialize the mutex.
+            let lock = UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER);
+            let mut attr = MaybeUninit::<libc::pthread_mutexattr_t>::uninit();
+            fatal_assert!(libc::pthread_mutexattr_init(attr.as_mut_ptr()) == 0);
+            let mut attr = attr.assume_init();
+            fatal_assert!(
                         libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_NORMAL) == 0
                     );
-                    fatal_assert!(libc::pthread_mutex_init(lock.get(), &attr) == 0);
-                    fatal_assert!(libc::pthread_mutexattr_destroy(&mut attr) == 0);
+            fatal_assert!(libc::pthread_mutex_init(lock.get(), &attr) == 0);
+            fatal_assert!(libc::pthread_mutexattr_destroy(&mut attr) == 0);
 
-                    let page = page as u64;
+            let page = page as u64;
 
-                    Barrier { lock, page, page_size }
-                }
-            };
-        }
+            Barrier { lock, page, page_size }
+        });
 
         /// Returns `true` if the `mprotect`-based trick is supported.
         pub fn is_supported() -> bool {
@@ -311,7 +298,7 @@ mod linux {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 mod windows {
     use core::sync::atomic;
     use windows_sys;

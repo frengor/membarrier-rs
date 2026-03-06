@@ -1,5 +1,3 @@
-#![no_std]
-
 extern crate membarrier;
 
 use core::sync::atomic::{fence, Ordering};
