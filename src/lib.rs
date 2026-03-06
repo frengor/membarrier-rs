@@ -142,49 +142,28 @@ mod linux {
     }
 
     mod membarrier {
-        /// Commands for the membarrier system call.
-        ///
-        /// # Caveat
-        ///
-        /// We're defining it here because, unfortunately, the `libc` crate currently doesn't
-        /// expose `membarrier_cmd` for us. You can find the numbers in the [Linux source
-        /// code](https://github.com/torvalds/linux/blob/master/include/uapi/linux/membarrier.h).
-        ///
-        /// This enum should really be `#[repr(libc::c_int)]`, but Rust currently doesn't allow it.
-        #[repr(i32)]
-        #[allow(dead_code, non_camel_case_types)]
-        enum membarrier_cmd {
-            MEMBARRIER_CMD_QUERY = 0,
-            MEMBARRIER_CMD_GLOBAL = (1 << 0),
-            MEMBARRIER_CMD_GLOBAL_EXPEDITED = (1 << 1),
-            MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED = (1 << 2),
-            MEMBARRIER_CMD_PRIVATE_EXPEDITED = (1 << 3),
-            MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED = (1 << 4),
-            MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE = (1 << 5),
-            MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE = (1 << 6),
-        }
 
         /// Call the `sys_membarrier` system call.
         #[inline]
-        fn sys_membarrier(cmd: membarrier_cmd) -> libc::c_long {
-            unsafe { libc::syscall(libc::SYS_membarrier, cmd as libc::c_int, 0 as libc::c_int) }
+        fn sys_membarrier(cmd: libc::c_int) -> libc::c_long {
+            unsafe { libc::syscall(libc::SYS_membarrier, cmd, 0 as libc::c_int) }
         }
 
         /// Returns `true` if the `sys_membarrier` call is available.
         pub fn is_supported() -> bool {
             // Queries which membarrier commands are supported. Checks if private expedited
             // membarrier is supported.
-            let ret = sys_membarrier(membarrier_cmd::MEMBARRIER_CMD_QUERY);
+            let ret = sys_membarrier(libc::MEMBARRIER_CMD_QUERY);
             if ret < 0
-                || ret & membarrier_cmd::MEMBARRIER_CMD_PRIVATE_EXPEDITED as libc::c_long == 0
-                || ret & membarrier_cmd::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as libc::c_long
+                || ret & libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED as libc::c_long == 0
+                || ret & libc::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as libc::c_long
                     == 0
             {
                 return false;
             }
 
             // Registers the current process as a user of private expedited membarrier.
-            if sys_membarrier(membarrier_cmd::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) < 0 {
+            if sys_membarrier(libc::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) < 0 {
                 return false;
             }
 
@@ -194,13 +173,12 @@ mod linux {
         /// Executes a heavy `sys_membarrier`-based barrier.
         #[inline]
         pub fn barrier() {
-            fatal_assert!(sys_membarrier(membarrier_cmd::MEMBARRIER_CMD_PRIVATE_EXPEDITED) >= 0);
+            fatal_assert!(sys_membarrier(libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED) >= 0);
         }
     }
 
     mod mprotect {
         use core::{cell::UnsafeCell, mem::MaybeUninit, ptr, sync::atomic};
-        use libc;
 
         struct Barrier {
             lock: UnsafeCell<libc::pthread_mutex_t>,
