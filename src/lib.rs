@@ -165,6 +165,15 @@ mod linux {
         pub fn barrier() {
             fatal_assert!(sys_membarrier(libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED) >= 0);
         }
+
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn test_membarrier() {
+                assert!(super::is_supported());
+                super::barrier();
+            }
+        }
     }
 
     mod mprotect {
@@ -253,6 +262,14 @@ mod linux {
         #[inline]
         pub fn barrier() {
             BARRIER.barrier();
+        }
+
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn test_mprotect() {
+                super::barrier();
+            }
         }
     }
 
