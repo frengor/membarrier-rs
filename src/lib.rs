@@ -228,7 +228,7 @@ mod linux {
             let page = libc::mmap(
                 ptr::null_mut(),
                 page_size,
-                libc::PROT_NONE,
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1 as libc::c_int,
                 0 as libc::off_t,
