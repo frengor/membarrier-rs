@@ -168,11 +168,11 @@ mod linux {
     }
 
     mod mprotect {
-        use core::{cell::UnsafeCell, mem::MaybeUninit, ptr, sync::atomic};
-        use std::sync::LazyLock;
+        use core::{ptr, sync::atomic};
+        use std::sync::{LazyLock, Mutex};
 
         struct Barrier {
-            lock: UnsafeCell<libc::pthread_mutex_t>,
+            lock: Mutex<()>,
             page: *mut libc::c_void,
             page_size: libc::size_t,
         }
@@ -188,7 +188,7 @@ mod linux {
             fn barrier(&self) {
                 unsafe {
                     // Lock the mutex.
-                    fatal_assert!(libc::pthread_mutex_lock(self.lock.get()) == 0);
+                    let _guard = self.lock.lock();
 
                     // Set the page access protections to read + write.
                     fatal_assert!(
@@ -208,8 +208,7 @@ mod linux {
                     // the processor buffers.
                     fatal_assert!(libc::mprotect(self.page, self.page_size, libc::PROT_NONE) == 0);
 
-                    // Unlock the mutex.
-                    fatal_assert!(libc::pthread_mutex_unlock(self.lock.get()) == 0);
+                    // Guard is dropped and mutex is unlocked
                 }
             }
         }
@@ -242,18 +241,7 @@ mod linux {
             // they would not have the expected effect of generating IPI.
             fatal_assert!(libc::mlock(page, page_size) == 0);
 
-            // Initialize the mutex.
-            let lock = UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER);
-            let mut attr = MaybeUninit::<libc::pthread_mutexattr_t>::uninit();
-            fatal_assert!(libc::pthread_mutexattr_init(attr.as_mut_ptr()) == 0);
-            let mut attr = attr.assume_init();
-            fatal_assert!(
-                        libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_NORMAL) == 0
-                    );
-            fatal_assert!(libc::pthread_mutex_init(lock.get(), &attr) == 0);
-            fatal_assert!(libc::pthread_mutexattr_destroy(&mut attr) == 0);
-
-            Barrier { lock, page, page_size }
+            Barrier { lock: const { Mutex::new(()) }, page, page_size }
         });
 
         /// Returns `true` if the `mprotect`-based trick is supported.
