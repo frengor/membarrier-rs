@@ -111,12 +111,11 @@ mod linux {
 
     /// A choice between three strategies for process-wide barrier on Linux.
     #[derive(Clone, Copy, PartialEq, Eq)]
+    #[allow(dead_code)]
     enum Strategy {
         /// Use the `membarrier` system call.
         Membarrier,
-        /// Use the `mprotect`-based trick.
-        Mprotect,
-        /// Use `SeqCst` fences.
+        /// Use the `mprotect`-based trick on x86 and x86_64, otherwise use `SeqCst` fences.
         Fallback,
     }
 
@@ -124,8 +123,6 @@ mod linux {
     static STRATEGY: LazyLock<Strategy> = LazyLock::new(|| {
         if membarrier::is_supported() {
             Strategy::Membarrier
-        } else if mprotect::is_supported() {
-            Strategy::Mprotect
         } else {
             Strategy::Fallback
         }
@@ -176,6 +173,7 @@ mod linux {
         }
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     mod mprotect {
         use core::{ptr, sync::atomic};
         use std::sync::{LazyLock, Mutex};
@@ -253,11 +251,6 @@ mod linux {
             Barrier { lock: const { Mutex::new(()) }, page, page_size }
         });
 
-        /// Returns `true` if the `mprotect`-based trick is supported.
-        pub fn is_supported() -> bool {
-            cfg!(target_arch = "x86") || cfg!(target_arch = "x86_64")
-        }
-
         /// Executes a heavy `mprotect`-based barrier.
         #[inline]
         pub fn barrier() {
@@ -282,7 +275,7 @@ mod linux {
     pub fn light() {
         use self::Strategy::*;
         match *STRATEGY {
-            Membarrier | Mprotect => atomic::compiler_fence(atomic::Ordering::SeqCst),
+            Membarrier => atomic::compiler_fence(atomic::Ordering::SeqCst),
             Fallback => atomic::fence(atomic::Ordering::SeqCst),
         }
     }
@@ -297,8 +290,15 @@ mod linux {
         use self::Strategy::*;
         match *STRATEGY {
             Membarrier => membarrier::barrier(),
-            Mprotect => mprotect::barrier(),
-            Fallback => atomic::fence(atomic::Ordering::SeqCst),
+            Fallback => {
+                cfg_if::cfg_if! {
+                    if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+                        mprotect::barrier()
+                    } else {
+                        atomic::fence(atomic::Ordering::SeqCst)
+                    }
+                }
+            },
         }
     }
 }
