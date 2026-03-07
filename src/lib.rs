@@ -107,26 +107,25 @@ mod default {
 #[cfg(target_os = "linux")]
 mod linux {
     use core::sync::atomic;
-    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use crossbeam_utils::CachePadded;
 
-    /// A choice between three strategies for process-wide barrier on Linux.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    #[allow(dead_code)]
-    enum Strategy {
-        /// Use the `membarrier` system call.
-        Membarrier,
-        /// Use the `mprotect`-based trick on x86 and x86_64, otherwise use `SeqCst` fences.
-        Fallback,
-    }
+    /// Whether the `membarrier` system call is supported.
+    ///
+    /// If not supported, a fallback implementation is used (`mprotect`-based trick on x86
+    /// and x86_64, otherwise `SeqCst` fences).
+    static MEMBARRIER_SUPPORTED: CachePadded<AtomicBool> = CachePadded::new(AtomicBool::new(false));
 
-    /// The right strategy to use on the current machine.
-    static STRATEGY: LazyLock<Strategy> = LazyLock::new(|| {
+    #[cfg(not(test))] // Prefer manual initialization in tests
+    #[ctor::ctor]
+    unsafe fn check_supported_membarrier() {
         if membarrier::is_supported() {
-            Strategy::Membarrier
+            MEMBARRIER_SUPPORTED.store(true, Ordering::SeqCst);
         } else {
-            Strategy::Fallback
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            mprotect::init_barrier();
         }
-    });
+    }
 
     mod membarrier {
 
@@ -175,81 +174,98 @@ mod linux {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     mod mprotect {
-        use core::{ptr, sync::atomic};
-        use std::sync::{LazyLock, Mutex};
+        use std::ptr;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
         struct Barrier {
             lock: Mutex<()>,
-            page: *mut libc::c_void,
-            page_size: libc::size_t,
+            page: AtomicPtr<libc::c_void>,
+            page_size: AtomicUsize, // Use Atomic<libc::size_t> when generic_atomic is stabilized
         }
 
         unsafe impl Sync for Barrier {}
         unsafe impl Send for Barrier {}
 
+        static BARRIER: Barrier = Barrier {
+            lock: Mutex::new(()),
+            page: AtomicPtr::new(ptr::null_mut()),
+            page_size: AtomicUsize::new(0),
+        };
+
         impl Barrier {
             /// Issues a process-wide barrier by changing access protections of a single mmap-ed
             /// page. This method is not as fast as the `sys_membarrier()` call, but works very
             /// similarly.
-            #[inline]
+            #[inline(never)]
             fn barrier(&self) {
                 unsafe {
+                    let page = self.page.load(Ordering::SeqCst);
+                    let page_size = self.page_size.load(Ordering::SeqCst);
+
+                    fatal_assert!(!page.is_null());
+
                     // Lock the mutex.
                     let _guard = self.lock.lock();
 
                     // Set the page access protections to read + write.
                     fatal_assert!(
-                        libc::mprotect(self.page, self.page_size, libc::PROT_READ | libc::PROT_WRITE,)
+                        libc::mprotect(page, page_size, libc::PROT_READ | libc::PROT_WRITE,)
                             == 0
                     );
 
                     // Ensure that the page is dirty before we change the protection so that we
                     // prevent the OS from skipping the global TLB flush.
-                    let atomic_usize = &*(self.page as *const atomic::AtomicUsize);
-                    atomic_usize.fetch_add(1, atomic::Ordering::SeqCst);
+                    let atomic_usize = &*(page as *const AtomicUsize);
+                    atomic_usize.fetch_add(1, Ordering::SeqCst);
 
                     // Set the page access protections to none.
                     //
                     // Changing a page protection from read + write to none causes the OS to issue
                     // an interrupt to flush TLBs on all processors. This also results in flushing
                     // the processor buffers.
-                    fatal_assert!(libc::mprotect(self.page, self.page_size, libc::PROT_NONE) == 0);
+                    fatal_assert!(libc::mprotect(page, page_size, libc::PROT_NONE) == 0);
 
                     // Guard is dropped and mutex is unlocked
                 }
             }
+
+            /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
+            /// x86/x86-64 systems.
+            fn init_barrier(&self) {
+                unsafe {
+                    fatal_assert!(self.page.load(Ordering::SeqCst).is_null());
+
+                    // Find out the page size on the current system.
+                    let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+                    let page_size = if page_size > 0 {
+                        page_size as libc::size_t
+                    } else {
+                        0x1000 as libc::size_t
+                    };
+
+                    // Create a dummy page.
+                    let page = libc::mmap(
+                        ptr::null_mut(),
+                        page_size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1 as libc::c_int,
+                        0 as libc::off_t,
+                    );
+                    fatal_assert!(page != libc::MAP_FAILED);
+                    fatal_assert!(page as libc::size_t % page_size == 0);
+
+                    // Locking the page ensures that it stays in memory during the two mprotect
+                    // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
+                    // they would not have the expected effect of generating IPI.
+                    fatal_assert!(libc::mlock(page, page_size) == 0);
+
+                    self.page.store(page, Ordering::SeqCst);
+                    self.page_size.store(page_size, Ordering::SeqCst);
+                }
+            }
         }
-
-        /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
-        /// x86/x86-64 systems.
-        static BARRIER: LazyLock<Barrier> = LazyLock::new(|| unsafe {
-            // Find out the page size on the current system.
-            let page_size = libc::sysconf(libc::_SC_PAGESIZE);
-            let page_size = if page_size > 0 {
-                page_size as libc::size_t
-            } else {
-                0x1000 as libc::size_t
-            };
-
-            // Create a dummy page.
-            let page = libc::mmap(
-                ptr::null_mut(),
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1 as libc::c_int,
-                0 as libc::off_t,
-            );
-            fatal_assert!(page != libc::MAP_FAILED);
-            fatal_assert!(page as libc::size_t % page_size == 0);
-
-            // Locking the page ensures that it stays in memory during the two mprotect
-            // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
-            // they would not have the expected effect of generating IPI.
-            fatal_assert!(libc::mlock(page, page_size) == 0);
-
-            Barrier { lock: const { Mutex::new(()) }, page, page_size }
-        });
 
         /// Executes a heavy `mprotect`-based barrier.
         #[inline]
@@ -257,10 +273,17 @@ mod linux {
             BARRIER.barrier();
         }
 
+        /// Initializes the `mprotect`-based barrier.
+        #[inline]
+        pub(super) fn init_barrier() {
+            BARRIER.init_barrier();
+        }
+
         #[cfg(test)]
         mod tests {
             #[test]
             fn test_mprotect() {
+                super::init_barrier();
                 super::barrier();
             }
         }
@@ -271,13 +294,16 @@ mod linux {
     /// It issues a compiler fence, which disallows compiler optimizations across itself. It incurs
     /// basically no costs in run-time.
     #[inline]
-    #[allow(dead_code)]
     pub fn light() {
-        use self::Strategy::*;
-        match *STRATEGY {
-            Membarrier => atomic::compiler_fence(atomic::Ordering::SeqCst),
-            Fallback => atomic::fence(atomic::Ordering::SeqCst),
+        // On x86 and x86_64 mprotect is always available as fallback.
+        // On other platforms, use a relaxed load to reduce the overhead to a minimum.
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        if !MEMBARRIER_SUPPORTED.load(Ordering::Relaxed) {
+            cold();
+            atomic::fence(Ordering::SeqCst);
         }
+
+        atomic::compiler_fence(Ordering::SeqCst)
     }
 
     /// Issues a heavy memory barrier for slow path.
@@ -285,22 +311,24 @@ mod linux {
     /// It issues a private expedited membarrier using the `sys_membarrier()` system call, if
     /// supported; otherwise, it falls back to `mprotect()`-based process-wide memory barrier.
     #[inline]
-    #[allow(dead_code)]
     pub fn heavy() {
-        use self::Strategy::*;
-        match *STRATEGY {
-            Membarrier => membarrier::barrier(),
-            Fallback => {
-                cfg_if::cfg_if! {
-                    if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
-                        mprotect::barrier()
-                    } else {
-                        atomic::fence(atomic::Ordering::SeqCst)
-                    }
+        if MEMBARRIER_SUPPORTED.load(Ordering::SeqCst) {
+            membarrier::barrier()
+        } else {
+            cold();
+            cfg_if::cfg_if! {
+                if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+                    mprotect::barrier()
+                } else {
+                    atomic::fence(atomic::Ordering::SeqCst)
                 }
-            },
+            }
         }
     }
+
+    #[cold]
+    #[inline(always)]
+    fn cold() {}
 }
 
 #[cfg(windows)]
