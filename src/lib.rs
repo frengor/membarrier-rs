@@ -61,18 +61,6 @@
 
 #![warn(missing_docs, missing_debug_implementations)]
 
-#[allow(unused_macros)]
-macro_rules! fatal_assert {
-    ($cond:expr) => {
-        if !$cond {
-            #[allow(unused_unsafe)]
-            unsafe {
-                libc::abort();
-            }
-        }
-    };
-}
-
 cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
         pub use crate::linux::*;
@@ -159,7 +147,9 @@ mod linux {
         /// Executes a heavy `sys_membarrier`-based barrier.
         #[inline]
         pub fn barrier() {
-            fatal_assert!(sys_membarrier(libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED) >= 0);
+            if sys_membarrier(libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED) < 0 {
+                panic!("Membarrier syscall failed: {}", std::io::Error::last_os_error());
+            }
         }
 
         #[cfg(test)]
@@ -203,16 +193,15 @@ mod linux {
                     let page = self.page.load(Ordering::SeqCst);
                     let page_size = self.page_size.load(Ordering::SeqCst);
 
-                    fatal_assert!(!page.is_null());
+                    assert!(!page.is_null(), "Mprotect barrier is not initialized");
 
                     // Lock the mutex.
                     let _guard = self.lock.lock();
 
                     // Set the page access protections to read + write.
-                    fatal_assert!(
-                        libc::mprotect(page, page_size, libc::PROT_READ | libc::PROT_WRITE,)
-                            == 0
-                    );
+                    if libc::mprotect(page, page_size, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                        panic!("Mprotect barrier first mprotect failed: {}", std::io::Error::last_os_error());
+                    }
 
                     // Ensure that the page is dirty before we change the protection so that we
                     // prevent the OS from skipping the global TLB flush.
@@ -224,7 +213,9 @@ mod linux {
                     // Changing a page protection from read + write to none causes the OS to issue
                     // an interrupt to flush TLBs on all processors. This also results in flushing
                     // the processor buffers.
-                    fatal_assert!(libc::mprotect(page, page_size, libc::PROT_NONE) == 0);
+                    if libc::mprotect(page, page_size, libc::PROT_NONE) != 0 {
+                        panic!("Mprotect barrier second mprotect failed: {}", std::io::Error::last_os_error());
+                    }
 
                     // Guard is dropped and mutex is unlocked
                 }
@@ -233,8 +224,22 @@ mod linux {
             /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
             /// x86/x86-64 systems.
             fn init_barrier(&self) {
+                fn fatal_assert(cond: bool, msg: &'static str, print_errno: bool) {
+                    if !cond {
+                        unsafe {
+                            if print_errno {
+                                libc_print::libc_eprint!("{}: ", msg);
+                                libc::perror(ptr::null_mut());
+                            } else {
+                                libc_print::libc_eprintln!("{}", msg);
+                            }
+                            libc::abort();
+                        }
+                    }
+                }
+
                 unsafe {
-                    fatal_assert!(self.page.load(Ordering::SeqCst).is_null());
+                    fatal_assert(self.page.load(Ordering::SeqCst).is_null(), "Mprotect barrier is already initialized", false);
 
                     // Find out the page size on the current system.
                     let page_size = libc::sysconf(libc::_SC_PAGESIZE);
@@ -253,13 +258,13 @@ mod linux {
                         -1 as libc::c_int,
                         0 as libc::off_t,
                     );
-                    fatal_assert!(page != libc::MAP_FAILED);
-                    fatal_assert!(page as libc::size_t % page_size == 0);
+                    fatal_assert(page != libc::MAP_FAILED, "Mprotect barrier mmap failed", true);
+                    fatal_assert((page as libc::size_t).is_multiple_of(page_size), "Mprotect barrier mmap failed: returned page is not aligned", false);
 
                     // Locking the page ensures that it stays in memory during the two mprotect
                     // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
                     // they would not have the expected effect of generating IPI.
-                    fatal_assert!(libc::mlock(page, page_size) == 0);
+                    fatal_assert(libc::mlock(page, page_size) == 0, "Mprotect barrier mlock failed", true);
 
                     self.page.store(page, Ordering::SeqCst);
                     self.page_size.store(page_size, Ordering::SeqCst);
@@ -311,6 +316,7 @@ mod linux {
     /// It issues a private expedited membarrier using the `sys_membarrier()` system call, if
     /// supported; otherwise, it falls back to `mprotect()`-based process-wide memory barrier.
     #[inline]
+    #[track_caller]
     pub fn heavy() {
         if MEMBARRIER_SUPPORTED.load(Ordering::SeqCst) {
             membarrier::barrier()
