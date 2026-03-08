@@ -62,7 +62,9 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 cfg_if::cfg_if! {
-    if #[cfg(any(target_os = "linux", target_os = "android"))] {
+    if #[cfg(miri)] {
+        pub use crate::default::*;
+    } else if #[cfg(any(target_os = "linux", target_os = "android"))] {
         pub use crate::linux::*;
     } else if #[cfg(windows)] {
         pub use crate::windows::*;
@@ -92,6 +94,7 @@ mod default {
     }
 }
 
+#[cfg(not(miri))]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     use core::sync::atomic;
@@ -361,6 +364,7 @@ mod linux {
     fn cold() {}
 }
 
+#[cfg(not(miri))]
 #[cfg(windows)]
 mod windows {
     use core::sync::atomic;
