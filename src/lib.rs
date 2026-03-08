@@ -73,7 +73,7 @@ cfg_if::cfg_if! {
 
 #[allow(dead_code)]
 mod default {
-    use core::sync::atomic::{fence, Ordering};
+    use core::sync::atomic::{Ordering, fence};
 
     /// Issues a light memory barrier for fast path.
     ///
@@ -95,8 +95,8 @@ mod default {
 #[cfg(target_os = "linux")]
 mod linux {
     use core::sync::atomic;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use crossbeam_utils::CachePadded;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Whether the `membarrier` system call is supported.
     ///
@@ -130,8 +130,7 @@ mod linux {
             let ret = sys_membarrier(libc::MEMBARRIER_CMD_QUERY);
             if ret < 0
                 || ret & libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED as libc::c_long == 0
-                || ret & libc::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as libc::c_long
-                    == 0
+                || ret & libc::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as libc::c_long == 0
             {
                 return false;
             }
@@ -148,7 +147,10 @@ mod linux {
         #[inline]
         pub fn barrier() {
             if sys_membarrier(libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED) < 0 {
-                panic!("Membarrier syscall failed: {}", std::io::Error::last_os_error());
+                panic!(
+                    "Membarrier syscall failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
 
@@ -200,7 +202,10 @@ mod linux {
 
                     // Set the page access protections to read + write.
                     if libc::mprotect(page, page_size, libc::PROT_READ | libc::PROT_WRITE) != 0 {
-                        panic!("Mprotect barrier first mprotect failed: {}", std::io::Error::last_os_error());
+                        panic!(
+                            "Mprotect barrier first mprotect failed: {}",
+                            std::io::Error::last_os_error()
+                        );
                     }
 
                     // Ensure that the page is dirty before we change the protection so that we
@@ -214,7 +219,10 @@ mod linux {
                     // an interrupt to flush TLBs on all processors. This also results in flushing
                     // the processor buffers.
                     if libc::mprotect(page, page_size, libc::PROT_NONE) != 0 {
-                        panic!("Mprotect barrier second mprotect failed: {}", std::io::Error::last_os_error());
+                        panic!(
+                            "Mprotect barrier second mprotect failed: {}",
+                            std::io::Error::last_os_error()
+                        );
                     }
 
                     // Guard is dropped and mutex is unlocked
@@ -239,7 +247,11 @@ mod linux {
                 }
 
                 unsafe {
-                    fatal_assert(self.page.load(Ordering::SeqCst).is_null(), "Mprotect barrier is already initialized", false);
+                    fatal_assert(
+                        self.page.load(Ordering::SeqCst).is_null(),
+                        "Mprotect barrier is already initialized",
+                        false,
+                    );
 
                     // Find out the page size on the current system.
                     let page_size = libc::sysconf(libc::_SC_PAGESIZE);
@@ -258,13 +270,25 @@ mod linux {
                         -1 as libc::c_int,
                         0 as libc::off_t,
                     );
-                    fatal_assert(page != libc::MAP_FAILED, "Mprotect barrier mmap failed", true);
-                    fatal_assert((page as libc::size_t).is_multiple_of(page_size), "Mprotect barrier mmap failed: returned page is not aligned", false);
+                    fatal_assert(
+                        page != libc::MAP_FAILED,
+                        "Mprotect barrier mmap failed",
+                        true,
+                    );
+                    fatal_assert(
+                        (page as libc::size_t).is_multiple_of(page_size),
+                        "Mprotect barrier mmap failed: returned page is not aligned",
+                        false,
+                    );
 
                     // Locking the page ensures that it stays in memory during the two mprotect
                     // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
                     // they would not have the expected effect of generating IPI.
-                    fatal_assert(libc::mlock(page, page_size) == 0, "Mprotect barrier mlock failed", true);
+                    fatal_assert(
+                        libc::mlock(page, page_size) == 0,
+                        "Mprotect barrier mlock failed",
+                        true,
+                    );
 
                     self.page.store(page, Ordering::SeqCst);
                     self.page_size.store(page_size, Ordering::SeqCst);
