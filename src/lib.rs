@@ -62,7 +62,7 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 cfg_if::cfg_if! {
-    if #[cfg(miri)] {
+    if #[cfg(any(miri, loom))] {
         pub use crate::default::*;
     } else if #[cfg(any(target_os = "linux", target_os = "android"))] {
         pub use crate::linux::*;
@@ -75,6 +75,10 @@ cfg_if::cfg_if! {
 
 #[allow(dead_code)]
 mod default {
+    #[cfg(loom)]
+    use loom::sync::atomic::{Ordering, fence};
+
+    #[cfg(not(loom))]
     use core::sync::atomic::{Ordering, fence};
 
     /// Issues a light memory barrier for fast path.
@@ -95,6 +99,7 @@ mod default {
 }
 
 #[cfg(not(miri))]
+#[cfg(not(loom))]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     use core::sync::atomic;
@@ -365,6 +370,7 @@ mod linux {
 }
 
 #[cfg(not(miri))]
+#[cfg(not(loom))]
 #[cfg(windows)]
 mod windows {
     use core::sync::atomic;

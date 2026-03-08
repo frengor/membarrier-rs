@@ -25,3 +25,9 @@ libc-print = "0.1.23"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = ">=0.59, <=0.61.2", features = ["Win32_System_Threading"] }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
