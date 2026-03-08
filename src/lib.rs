@@ -62,7 +62,7 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 cfg_if::cfg_if! {
-    if #[cfg(target_os = "linux")] {
+    if #[cfg(any(target_os = "linux", target_os = "android"))] {
         pub use crate::linux::*;
     } else if #[cfg(windows)] {
         pub use crate::windows::*;
@@ -92,7 +92,7 @@ mod default {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     use core::sync::atomic;
     use crossbeam_utils::CachePadded;
