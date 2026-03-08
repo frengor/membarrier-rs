@@ -78,7 +78,7 @@ mod default {
     /// Issues a light memory barrier for fast path.
     ///
     /// It just issues the normal memory barrier instruction.
-    #[inline]
+    #[inline(always)]
     pub fn light() {
         fence(Ordering::SeqCst);
     }
@@ -86,7 +86,7 @@ mod default {
     /// Issues a heavy memory barrier for slow path.
     ///
     /// It just issues the normal memory barrier instruction.
-    #[inline]
+    #[inline(always)]
     pub fn heavy() {
         fence(Ordering::SeqCst);
     }
@@ -322,7 +322,7 @@ mod linux {
     ///
     /// It issues a compiler fence, which disallows compiler optimizations across itself. It incurs
     /// basically no costs in run-time.
-    #[inline]
+    #[inline(always)]
     pub fn light() {
         // On x86 and x86_64 mprotect is always available as fallback.
         // On other platforms, use a relaxed load to reduce the overhead to a minimum.
@@ -369,7 +369,7 @@ mod windows {
     /// Issues light memory barrier for fast path.
     ///
     /// It issues compiler fence, which disallows compiler optimizations across itself.
-    #[inline]
+    #[inline(always)]
     pub fn light() {
         atomic::compiler_fence(atomic::Ordering::SeqCst);
     }
