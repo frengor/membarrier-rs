@@ -26,6 +26,9 @@ libc-print = "0.1.23"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = ">=0.59, <=0.61.2", features = ["Win32_System_Threading"] }
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+mach2 = "0.6"
+
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
