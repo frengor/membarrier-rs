@@ -63,16 +63,45 @@
 
 cfg_if::cfg_if! {
     if #[cfg(any(miri, loom))] {
-        pub use crate::default::*;
+        use crate::default::BarrierImpl;
     } else if #[cfg(any(target_os = "linux", target_os = "android"))] {
-        pub use crate::linux::*;
+        mod check_support;
+        use crate::check_support::BarrierImpl;
     } else if #[cfg(windows)] {
-        pub use crate::windows::*;
+        mod windows;
+        use crate::windows::BarrierImpl;
     } else if #[cfg(target_vendor = "apple")] {
-        pub use crate::apple::*;
+        mod apple;
+        use crate::apple::BarrierImpl;
     } else {
-        pub use crate::default::*;
+        use crate::default::BarrierImpl;
     }
+}
+
+/// Issues a light memory barrier for fast path.
+///
+/// It just issues the normal memory barrier instruction.
+#[inline(always)]
+pub fn light() {
+    <BarrierImpl as Barrier>::light();
+}
+
+/// Issues a heavy memory barrier for slow path.
+///
+/// It just issues the normal memory barrier instruction.
+#[inline(always)]
+#[track_caller]
+pub fn heavy() {
+    <BarrierImpl as Barrier>::heavy();
+}
+
+pub(crate) trait Barrier {
+    /// Issues a light memory barrier for fast path.
+    fn light();
+
+    /// Issues a heavy memory barrier for slow path.
+    #[track_caller]
+    fn heavy();
 }
 
 #[allow(dead_code)]
@@ -83,420 +112,23 @@ mod default {
     #[cfg(not(loom))]
     use core::sync::atomic::{Ordering, fence};
 
-    /// Issues a light memory barrier for fast path.
-    ///
-    /// It just issues the normal memory barrier instruction.
-    #[inline(always)]
-    pub fn light() {
-        fence(Ordering::SeqCst);
-    }
+    pub(super) struct BarrierImpl;
 
-    /// Issues a heavy memory barrier for slow path.
-    ///
-    /// It just issues the normal memory barrier instruction.
-    #[inline(always)]
-    pub fn heavy() {
-        fence(Ordering::SeqCst);
-    }
-}
-
-#[cfg(not(miri))]
-#[cfg(not(loom))]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod linux {
-    use core::sync::atomic;
-    use crossbeam_utils::CachePadded;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// Whether the `membarrier` system call is supported.
-    ///
-    /// If not supported, a fallback implementation is used (`mprotect`-based trick on x86
-    /// and x86_64, otherwise `SeqCst` fences).
-    static MEMBARRIER_SUPPORTED: CachePadded<AtomicBool> = CachePadded::new(AtomicBool::new(false));
-
-    #[cfg(not(test))] // Prefer manual initialization in tests
-    #[ctor::ctor]
-    unsafe fn check_supported_membarrier() {
-        if membarrier::is_supported() {
-            MEMBARRIER_SUPPORTED.store(true, Ordering::SeqCst);
-        } else {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            mprotect::init_barrier();
-        }
-    }
-
-    mod membarrier {
-
-        /// Call the `sys_membarrier` system call.
-        #[inline]
-        fn sys_membarrier(cmd: libc::c_int) -> libc::c_long {
-            unsafe { libc::syscall(libc::SYS_membarrier, cmd, 0 as libc::c_int) }
+    impl crate::Barrier for BarrierImpl {
+        /// Issues a light memory barrier for fast path.
+        ///
+        /// It just issues the normal memory barrier instruction.
+        #[inline(always)]
+        fn light() {
+            fence(Ordering::SeqCst);
         }
 
-        /// Returns `true` if the `sys_membarrier` call is available.
-        pub fn is_supported() -> bool {
-            // Queries which membarrier commands are supported. Checks if private expedited
-            // membarrier is supported.
-            let ret = sys_membarrier(libc::MEMBARRIER_CMD_QUERY);
-            if ret < 0
-                || ret & libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED as libc::c_long == 0
-                || ret & libc::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as libc::c_long == 0
-            {
-                return false;
-            }
-
-            // Registers the current process as a user of private expedited membarrier.
-            if sys_membarrier(libc::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) < 0 {
-                return false;
-            }
-
-            true
-        }
-
-        /// Executes a heavy `sys_membarrier`-based barrier.
-        #[inline]
-        pub fn barrier() {
-            if sys_membarrier(libc::MEMBARRIER_CMD_PRIVATE_EXPEDITED) < 0 {
-                panic!(
-                    "Membarrier syscall failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-
-        #[cfg(test)]
-        mod tests {
-            #[test]
-            fn test_membarrier() {
-                assert!(super::is_supported());
-                super::barrier();
-            }
-        }
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    mod mprotect {
-        use std::ptr;
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-
-        struct Barrier {
-            lock: Mutex<()>,
-            page: AtomicPtr<libc::c_void>,
-            page_size: AtomicUsize, // Use Atomic<libc::size_t> when generic_atomic is stabilized
-        }
-
-        unsafe impl Sync for Barrier {}
-        unsafe impl Send for Barrier {}
-
-        static BARRIER: Barrier = Barrier {
-            lock: Mutex::new(()),
-            page: AtomicPtr::new(ptr::null_mut()),
-            page_size: AtomicUsize::new(0),
-        };
-
-        impl Barrier {
-            /// Issues a process-wide barrier by changing access protections of a single mmap-ed
-            /// page. This method is not as fast as the `sys_membarrier()` call, but works very
-            /// similarly.
-            #[inline(never)]
-            fn barrier(&self) {
-                unsafe {
-                    let page = self.page.load(Ordering::SeqCst);
-                    let page_size = self.page_size.load(Ordering::SeqCst);
-
-                    assert!(!page.is_null(), "Mprotect barrier is not initialized");
-
-                    // Lock the mutex.
-                    self.lock.clear_poison(); // Ignore poisoning
-                    let Ok(_guard) = self.lock.lock() else {
-                        panic!("Mprotect barrier mutex is poisoned") // Should never happen
-                    };
-
-                    // Set the page access protections to read + write.
-                    if libc::mprotect(page, page_size, libc::PROT_READ | libc::PROT_WRITE) != 0 {
-                        panic!(
-                            "Mprotect barrier first mprotect failed: {}",
-                            std::io::Error::last_os_error()
-                        );
-                    }
-
-                    // Ensure that the page is dirty before we change the protection so that we
-                    // prevent the OS from skipping the global TLB flush.
-                    let atomic_usize = &*(page as *const AtomicUsize);
-                    atomic_usize.fetch_add(1, Ordering::SeqCst);
-
-                    // Set the page access protections to none.
-                    //
-                    // Changing a page protection from read + write to none causes the OS to issue
-                    // an interrupt to flush TLBs on all processors. This also results in flushing
-                    // the processor buffers.
-                    if libc::mprotect(page, page_size, libc::PROT_NONE) != 0 {
-                        panic!(
-                            "Mprotect barrier second mprotect failed: {}",
-                            std::io::Error::last_os_error()
-                        );
-                    }
-
-                    // Guard is dropped and mutex is unlocked
-                }
-            }
-
-            /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
-            /// x86/x86-64 systems.
-            fn init_barrier(&self) {
-                fn fatal_assert(cond: bool, msg: &'static str, print_errno: bool) {
-                    if !cond {
-                        unsafe {
-                            if print_errno {
-                                libc_print::libc_eprint!("{}: ", msg);
-                                libc::perror(ptr::null_mut());
-                            } else {
-                                libc_print::libc_eprintln!("{}", msg);
-                            }
-                            libc::abort();
-                        }
-                    }
-                }
-
-                unsafe {
-                    fatal_assert(
-                        self.page.load(Ordering::SeqCst).is_null(),
-                        "Mprotect barrier is already initialized",
-                        false,
-                    );
-
-                    // Find out the page size on the current system.
-                    let page_size = libc::sysconf(libc::_SC_PAGESIZE);
-                    let page_size = if page_size > 0 {
-                        page_size as libc::size_t
-                    } else {
-                        0x1000 as libc::size_t
-                    };
-
-                    // Create a dummy page.
-                    let page = libc::mmap(
-                        ptr::null_mut(),
-                        page_size,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1 as libc::c_int,
-                        0 as libc::off_t,
-                    );
-                    fatal_assert(
-                        page != libc::MAP_FAILED,
-                        "Mprotect barrier mmap failed",
-                        true,
-                    );
-                    fatal_assert(
-                        (page as libc::size_t).is_multiple_of(page_size),
-                        "Mprotect barrier mmap failed: returned page is not aligned",
-                        false,
-                    );
-
-                    // Locking the page ensures that it stays in memory during the two mprotect
-                    // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
-                    // they would not have the expected effect of generating IPI.
-                    fatal_assert(
-                        libc::mlock(page, page_size) == 0,
-                        "Mprotect barrier mlock failed",
-                        true,
-                    );
-
-                    self.page.store(page, Ordering::SeqCst);
-                    self.page_size.store(page_size, Ordering::SeqCst);
-                }
-            }
-        }
-
-        /// Executes a heavy `mprotect`-based barrier.
-        #[inline]
-        pub fn barrier() {
-            BARRIER.barrier();
-        }
-
-        /// Initializes the `mprotect`-based barrier.
-        #[inline]
-        pub(super) fn init_barrier() {
-            BARRIER.init_barrier();
-        }
-
-        #[cfg(test)]
-        mod tests {
-            #[test]
-            fn test_mprotect() {
-                super::init_barrier();
-                super::barrier();
-            }
-        }
-    }
-
-    /// Issues a light memory barrier for fast path.
-    ///
-    /// It issues a compiler fence, which disallows compiler optimizations across itself. It incurs
-    /// basically no costs in run-time.
-    #[inline(always)]
-    pub fn light() {
-        // On x86 and x86_64 mprotect is always available as fallback.
-        // On other platforms, use a relaxed load to reduce the overhead to a minimum.
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        if !MEMBARRIER_SUPPORTED.load(Ordering::Relaxed) {
-            crate::cold();
-            atomic::fence(Ordering::SeqCst);
-        }
-
-        atomic::compiler_fence(Ordering::SeqCst)
-    }
-
-    /// Issues a heavy memory barrier for slow path.
-    ///
-    /// It issues a private expedited membarrier using the `sys_membarrier()` system call, if
-    /// supported; otherwise, it falls back to `mprotect()`-based process-wide memory barrier.
-    #[inline]
-    #[track_caller]
-    pub fn heavy() {
-        if MEMBARRIER_SUPPORTED.load(Ordering::SeqCst) {
-            membarrier::barrier()
-        } else {
-            crate::cold();
-            cfg_if::cfg_if! {
-                if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
-                    mprotect::barrier()
-                } else {
-                    atomic::fence(atomic::Ordering::SeqCst)
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(miri))]
-#[cfg(not(loom))]
-#[cfg(windows)]
-mod windows {
-    use core::sync::atomic;
-    use windows_sys;
-
-    /// Issues light memory barrier for fast path.
-    ///
-    /// It issues compiler fence, which disallows compiler optimizations across itself.
-    #[inline(always)]
-    pub fn light() {
-        atomic::compiler_fence(atomic::Ordering::SeqCst);
-    }
-
-    /// Issues heavy memory barrier for slow path.
-    ///
-    /// It invokes the `FlushProcessWriteBuffers()` system call.
-    #[inline]
-    pub fn heavy() {
-        unsafe {
-            windows_sys::Win32::System::Threading::FlushProcessWriteBuffers();
-        }
-    }
-}
-
-#[cfg(not(miri))]
-#[cfg(not(loom))]
-#[cfg(target_vendor = "apple")]
-mod apple {
-    use core::sync::atomic;
-    use libc::{mach_error_string, thread_act_t, vm_deallocate};
-    use mach2::error::{err_get_code, err_get_sub, err_get_system};
-    use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
-    use mach2::mach_port::mach_port_deallocate;
-    use mach2::mach_types::thread_act_array_t;
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::task::task_threads;
-    use mach2::thread_state::thread_get_register_pointer_values;
-    use mach2::traps::mach_task_self;
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
-
-    /// Issues light memory barrier for fast path.
-    ///
-    /// It issues compiler fence, which disallows compiler optimizations across itself.
-    #[inline(always)]
-    pub fn light() {
-        atomic::compiler_fence(atomic::Ordering::SeqCst);
-    }
-
-    /// Issues heavy memory barrier for slow path.
-    ///
-    /// It invokes `thread_get_register_pointer_values()` for every thread in the current task.
-    #[track_caller]
-    #[inline(never)]
-    pub fn heavy() {
-        // https://github.com/dotnet/runtime/blob/c290dc12ccd792d6cb431f47efc46df8cb9a7747/src/native/minipal/memorybarrierprocesswide.c#L157
-        unsafe {
-            let mut threads = MaybeUninit::<thread_act_array_t>::uninit();
-            let mut threads_len = MaybeUninit::<mach_msg_type_number_t>::uninit();
-            let machret = task_threads(
-                mach_task_self(),
-                threads.as_mut_ptr(),
-                threads_len.as_mut_ptr(),
-            );
-            if machret != KERN_SUCCESS {
-                panic_with_msg(machret, "task_threads failed");
-            }
-
-            let threads = threads.assume_init();
-            let threads_len = threads_len.assume_init() as usize;
-            assert!(!threads.is_null(), "threads ptr is null");
-
-            const REGISTER_SIZE: usize = 128;
-            let mut register_values = [MaybeUninit::<usize>::uninit(); REGISTER_SIZE];
-            let mut sp = MaybeUninit::<usize>::uninit();
-            let mut first_err = None; // Reclaim memory before panicking
-
-            {
-                let threads_slice = std::slice::from_raw_parts_mut(threads, threads_len);
-                for &mut thread in threads_slice {
-                    // Request the threads pointer values to force the thread to emit a memory barrier
-                    let mut registers = REGISTER_SIZE;
-                    let machret = thread_get_register_pointer_values(
-                        thread,
-                        sp.as_mut_ptr(),
-                        &mut registers,
-                        register_values.as_mut_ptr().cast(),
-                    );
-                    if machret == libc::KERN_INSUFFICIENT_BUFFER_SIZE {
-                        crate::cold();
-                        first_err = first_err
-                            .or(Some((machret, "thread_get_register_pointer_values failed")));
-                    }
-                    let machret = mach_port_deallocate(mach_task_self(), thread);
-                    if machret != KERN_SUCCESS {
-                        crate::cold();
-                        first_err = first_err.or(Some((machret, "mach_port_deallocate failed")));
-                    }
-                }
-            }
-
-            let machret = vm_deallocate(
-                mach_task_self(),
-                threads as libc::vm_address_t,
-                (threads_len * size_of::<thread_act_t>()) as libc::vm_size_t,
-            );
-            if machret != KERN_SUCCESS {
-                crate::cold();
-                first_err = first_err.or(Some((machret, "vm_deallocate failed")));
-            }
-            if let Some((machret, msg)) = first_err {
-                panic_with_msg(machret, msg);
-            }
-        }
-    }
-
-    #[cold]
-    fn panic_with_msg(machret: kern_return_t, msg: &'static str) {
-        unsafe {
-            let err_msg: &'static CStr = CStr::from_ptr(mach_error_string(machret));
-            let err_msg = err_msg.to_string_lossy();
-            let sys = err_get_system(machret);
-            let sub = err_get_sub(machret);
-            let code = err_get_code(machret);
-            panic!("{msg}: {err_msg} (os error [{sys:#x}|{sub:#x}|{code:#x}])")
+        /// Issues a heavy memory barrier for slow path.
+        ///
+        /// It just issues the normal memory barrier instruction.
+        #[inline(always)]
+        fn heavy() {
+            fence(Ordering::SeqCst);
         }
     }
 }
@@ -504,4 +136,4 @@ mod apple {
 #[cold]
 #[allow(dead_code)]
 #[inline(always)]
-fn cold() {}
+pub(crate) fn cold() {}
