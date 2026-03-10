@@ -208,7 +208,10 @@ mod linux {
                     assert!(!page.is_null(), "Mprotect barrier is not initialized");
 
                     // Lock the mutex.
-                    let _guard = self.lock.lock();
+                    self.lock.clear_poison(); // Ignore poisoning
+                    let Ok(_guard) = self.lock.lock() else {
+                        panic!("Mprotect barrier mutex is poisoned") // Should never happen
+                    };
 
                     // Set the page access protections to read + write.
                     if libc::mprotect(page, page_size, libc::PROT_READ | libc::PROT_WRITE) != 0 {
