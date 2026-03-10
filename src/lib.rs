@@ -338,7 +338,7 @@ mod linux {
         // On other platforms, use a relaxed load to reduce the overhead to a minimum.
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         if !MEMBARRIER_SUPPORTED.load(Ordering::Relaxed) {
-            cold();
+            crate::cold();
             atomic::fence(Ordering::SeqCst);
         }
 
@@ -355,7 +355,7 @@ mod linux {
         if MEMBARRIER_SUPPORTED.load(Ordering::SeqCst) {
             membarrier::barrier()
         } else {
-            cold();
+            crate::cold();
             cfg_if::cfg_if! {
                 if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
                     mprotect::barrier()
@@ -365,10 +365,6 @@ mod linux {
             }
         }
     }
-
-    #[cold]
-    #[inline(always)]
-    fn cold() {}
 }
 
 #[cfg(not(miri))]
@@ -448,6 +444,7 @@ mod apple {
             const REGISTER_SIZE: usize = 128;
             let mut register_values = [MaybeUninit::<usize>::uninit(); REGISTER_SIZE];
             let mut sp = MaybeUninit::<usize>::uninit();
+            let mut first_err = None; // Reclaim memory before panicking
 
             {
                 let threads_slice = std::slice::from_raw_parts_mut(threads, threads_len);
@@ -461,11 +458,14 @@ mod apple {
                         register_values.as_mut_ptr().cast(),
                     );
                     if machret == libc::KERN_INSUFFICIENT_BUFFER_SIZE {
-                        panic_with_msg(machret, "thread_get_register_pointer_values failed");
+                        crate::cold();
+                        first_err = first_err
+                            .or(Some((machret, "thread_get_register_pointer_values failed")));
                     }
                     let machret = mach_port_deallocate(mach_task_self(), thread);
                     if machret != KERN_SUCCESS {
-                        panic_with_msg(machret, "mach_port_deallocate failed");
+                        crate::cold();
+                        first_err = first_err.or(Some((machret, "mach_port_deallocate failed")));
                     }
                 }
             }
@@ -476,7 +476,11 @@ mod apple {
                 (threads_len * size_of::<thread_act_t>()) as libc::vm_size_t,
             );
             if machret != KERN_SUCCESS {
-                panic_with_msg(machret, "vm_deallocate failed");
+                crate::cold();
+                first_err = first_err.or(Some((machret, "vm_deallocate failed")));
+            }
+            if let Some((machret, msg)) = first_err {
+                panic_with_msg(machret, msg);
             }
         }
     }
@@ -493,3 +497,8 @@ mod apple {
         }
     }
 }
+
+#[cold]
+#[allow(dead_code)]
+#[inline(always)]
+fn cold() {}
