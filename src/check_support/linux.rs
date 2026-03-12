@@ -79,7 +79,10 @@ mod mprotect {
                 let page = self.page.load(Ordering::SeqCst);
                 let page_size = self.page_size.load(Ordering::SeqCst);
 
-                assert!(!page.is_null(), "Mprotect barrier is not initialized");
+                assert!(
+                    !page.is_null() && page_size != 0,
+                    "Mprotect barrier is not initialized"
+                );
 
                 // Lock the mutex.
                 self.lock.clear_poison(); // Ignore poisoning
@@ -119,14 +122,29 @@ mod mprotect {
         /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
         /// x86/x86-64 systems.
         fn init_barrier(&self) {
-            fn fatal_assert(cond: bool, msg: &'static str, print_errno: bool) {
+            #[cold]
+            fn fatal_assert(cond: bool, msg: &'static str) {
                 if !cond {
                     unsafe {
-                        if print_errno {
-                            libc_print::libc_eprint!("{}: ", msg);
-                            libc::perror(ptr::null_mut());
+                        libc_print::libc_eprintln!("{}", msg);
+                        libc::abort();
+                    }
+                }
+            }
+
+            #[cold]
+            fn fatal_assert_print_errno(cond: bool, c_str_msg: &'static [u8]) {
+                if !cond {
+                    unsafe {
+                        if let Some(b'\0') = c_str_msg.last() {
+                            libc::perror(c_str_msg.as_ptr() as *const libc::c_char);
                         } else {
-                            libc_print::libc_eprintln!("{}", msg);
+                            // Should never happen
+                            libc::perror(ptr::null()); // Still print the system error
+                            libc_print::libc_eprintln!(
+                                "Invalid error string, missing NUL terminator (this is a bug in {} crate, please report it!)",
+                                env!("CARGO_CRATE_NAME")
+                            );
                         }
                         libc::abort();
                     }
@@ -137,7 +155,6 @@ mod mprotect {
                 fatal_assert(
                     self.page.load(Ordering::SeqCst).is_null(),
                     "Mprotect barrier is already initialized",
-                    false,
                 );
 
                 // Find out the page size on the current system.
@@ -157,24 +174,21 @@ mod mprotect {
                     -1 as libc::c_int,
                     0 as libc::off_t,
                 );
-                fatal_assert(
+                fatal_assert_print_errno(
                     page != libc::MAP_FAILED,
-                    "Mprotect barrier mmap failed",
-                    true,
+                    b"Mprotect barrier mmap failed\0",
                 );
                 fatal_assert(
                     (page as libc::size_t).is_multiple_of(page_size),
                     "Mprotect barrier mmap failed: returned page is not aligned",
-                    false,
                 );
 
                 // Locking the page ensures that it stays in memory during the two mprotect
                 // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
                 // they would not have the expected effect of generating IPI.
-                fatal_assert(
+                fatal_assert_print_errno(
                     libc::mlock(page, page_size) == 0,
-                    "Mprotect barrier mlock failed",
-                    true,
+                    b"Mprotect barrier mlock failed\0",
                 );
 
                 self.page.store(page, Ordering::SeqCst);
