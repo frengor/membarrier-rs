@@ -64,7 +64,7 @@
 cfg_if::cfg_if! {
     if #[cfg(any(miri, loom))] {
         use crate::default::BarrierImpl;
-    } else if #[cfg(any(target_os = "linux", target_os = "android"))] {
+    } else if #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))] {
         mod check_support;
         use crate::check_support::BarrierImpl;
     } else if #[cfg(windows)] {

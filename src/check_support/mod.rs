@@ -2,13 +2,21 @@
 //!
 //! If not supported, a fallback implementation is used.
 
-mod linux;
-
 use core::sync::atomic;
 use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use linux::MembarrierImpl;
+cfg_if::cfg_if! {
+    if #[cfg(any(target_os = "linux", target_os = "android"))] {
+        mod linux;
+        use linux::MembarrierImpl;
+    } else if #[cfg(target_os = "freebsd")] {
+        mod freebsd;
+        use freebsd::MembarrierImpl;
+    } else {
+        compile_error!(concat!("Unsupported platform. This is a bug in ", env!("CARGO_CRATE_NAME"), " crate, please report it!"));
+    }
+}
 
 /// Whether the `membarrier` system call is supported.
 ///
