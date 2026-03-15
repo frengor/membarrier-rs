@@ -1,7 +1,6 @@
 #![feature(test)]
 
 extern crate test;
-extern crate membarrier;
 
 use test::Bencher;
 use std::sync::atomic::{fence, Ordering};
@@ -9,7 +8,7 @@ use std::sync::atomic::{fence, Ordering};
 #[bench]
 fn light(b: &mut Bencher) {
     b.iter(|| {
-        membarrier::light();
+        membarrier2::light();
     });
 }
 
@@ -23,6 +22,6 @@ fn normal(b: &mut Bencher) {
 #[bench]
 fn heavy(b: &mut Bencher) {
     b.iter(|| {
-        membarrier::heavy();
+        membarrier2::heavy();
     });
 }

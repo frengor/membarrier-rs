@@ -141,8 +141,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "membarrier"
-version = "0.2.3"
+name = "membarrier2"
+version = "0.1.0"
 dependencies = [
  "cfg-if",
  "crossbeam-utils",
